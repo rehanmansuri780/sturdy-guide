@@ -1,0 +1,146 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+
+          Set-Service -Name TermService -StartupType Manual
+          Start-Service -Name TermService
+
+          Write-Host "RDP configuration completed."
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installer = "$env:TEMP\tailscale.msi"
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          $process = Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" `
+            -Wait `
+            -PassThru
+
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed: exit code $($process.ExitCode)"
+          }
+
+          Write-Host "Tailscale installation completed."
+
+      - name: Validate Tailscale Secret
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "TAILSCALE_AUTH_KEY is missing. Configure it in GitHub repository secrets."
+          }
+
+          Write-Host "Tailscale secret is configured."
+
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+            throw "Tailscale executable not found."
+          }
+
+          & $tailscale up `
+            --authkey="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale authentication failed. Check the auth key and tailnet configuration."
+          }
+
+          $tsIP = $null
+
+          for ($i = 0; $i -lt 12; $i++) {
+            $output = & $tailscale ip -4 2>$null
+
+            if ($LASTEXITCODE -eq 0 -and $output) {
+              $tsIP = ($output | Select-Object -First 1).Trim()
+
+              if ($tsIP -match '^100\.(\d{1,3}\.){2}\d{1,3}$') {
+                break
+              }
+
+              $tsIP = $null
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $tsIP) {
+            throw "No Tailscale IPv4 address was assigned."
+          }
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale connection established."
+
+      - name: Verify RDP Service
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $service = Get-Service -Name TermService
+
+          if ($service.Status -ne "Running") {
+            Start-Service -Name TermService
+          }
+
+          $listener = Get-NetTCPConnection `
+            -State Listen `
+            -LocalPort 3389 `
+            -ErrorAction SilentlyContinue
+
+          if (-not $listener) {
+            throw "RDP is not listening on TCP port 3389."
+          }
+
+          Write-Host "RDP service is listening."
+
+      - name: Report Connection Status
+        shell: pwsh
+        run: |
+          Write-Host "Runner: $env:COMPUTERNAME"
+          Write-Host "Tailscale IPv4: $env:TAILSCALE_IP"
+          Write-Host "RDP port: 3389"
+          Write-Host "Check Tailscale ACLs and device authorization before connecting."
